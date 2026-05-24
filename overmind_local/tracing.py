@@ -16,9 +16,17 @@ _agent_name_global: Optional[str] = None
 
 # ── Context helpers ────────────────────────────────────────────────────────────
 
-def set_agent_name(name: str):
-    """Set the current agent name (thread-local, affects all spans on this thread)."""
+def set_agent_name(name: str, *, global_default: bool = False):
+    """Set the current agent name (thread-local).
+
+    Pass global_default=True to also set a process-wide fallback that
+    background threads (callbacks, async workers) will see when they haven't
+    called set_agent_name themselves.
+    """
+    global _agent_name_global
     _local.agent_name = name
+    if global_default:
+        _agent_name_global = name
 
 
 def get_agent_name() -> Optional[str]:
@@ -79,57 +87,85 @@ def _safe(obj: Any) -> Any:
         return str(obj)
 
 
+def _capture_inputs(fn: Callable, args: tuple, kwargs: dict) -> Any:
+    try:
+        sig = inspect.signature(fn)
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return {k: v for k, v in bound.arguments.items() if k != "self"}
+    except Exception:
+        return {"args": _safe(args), "kwargs": _safe(kwargs)}
+
+
 # ── Decorator factory ──────────────────────────────────────────────────────────
 
 def _make_decorator(span_type: str):
-    def decorator_factory(name: Optional[str] = None):
+    def decorator_factory(name_or_fn=None):
         def decorator(fn: Callable) -> Callable:
-            span_name = name or fn.__name__
+            span_name = (name_or_fn if isinstance(name_or_fn, str) else None) or fn.__name__
 
-            @functools.wraps(fn)
-            def wrapper(*args, **kwargs):
-                span_id = str(uuid.uuid4())
-                trace_id = get_trace_id() or str(uuid.uuid4())
-
-                # Capture inputs
-                try:
-                    sig = inspect.signature(fn)
-                    bound = sig.bind(*args, **kwargs)
-                    bound.apply_defaults()
-                    input_data = {k: v for k, v in bound.arguments.items() if k != "self"}
-                except Exception:
-                    input_data = {"args": _safe(args), "kwargs": _safe(kwargs)}
-
-                start = time.time()
-                result = None
-                error_msg = None
-
-                with _span_ctx(span_id, trace_id):
-                    try:
-                        result = fn(*args, **kwargs)
-                        return result
-                    except Exception as exc:
-                        error_msg = str(exc)
-                        raise
-                    finally:
-                        _record(
-                            name=span_name,
-                            span_type=span_type,
-                            input_data=input_data,
-                            output_data=result,
-                            error=error_msg,
-                            start=start,
-                            end=time.time(),
-                            span_id=span_id,
-                            trace_id=trace_id,
-                        )
+            if inspect.iscoroutinefunction(fn):
+                @functools.wraps(fn)
+                async def wrapper(*args, **kwargs):
+                    span_id = str(uuid.uuid4())
+                    trace_id = get_trace_id() or str(uuid.uuid4())
+                    input_data = _capture_inputs(fn, args, kwargs)
+                    start = time.time()
+                    result = None
+                    error_msg = None
+                    with _span_ctx(span_id, trace_id):
+                        try:
+                            result = await fn(*args, **kwargs)
+                            return result
+                        except Exception as exc:
+                            error_msg = str(exc)
+                            raise
+                        finally:
+                            _record(
+                                name=span_name,
+                                span_type=span_type,
+                                input_data=input_data,
+                                output_data=result,
+                                error=error_msg,
+                                start=start,
+                                end=time.time(),
+                                span_id=span_id,
+                                trace_id=trace_id,
+                            )
+            else:
+                @functools.wraps(fn)
+                def wrapper(*args, **kwargs):
+                    span_id = str(uuid.uuid4())
+                    trace_id = get_trace_id() or str(uuid.uuid4())
+                    input_data = _capture_inputs(fn, args, kwargs)
+                    start = time.time()
+                    result = None
+                    error_msg = None
+                    with _span_ctx(span_id, trace_id):
+                        try:
+                            result = fn(*args, **kwargs)
+                            return result
+                        except Exception as exc:
+                            error_msg = str(exc)
+                            raise
+                        finally:
+                            _record(
+                                name=span_name,
+                                span_type=span_type,
+                                input_data=input_data,
+                                output_data=result,
+                                error=error_msg,
+                                start=start,
+                                end=time.time(),
+                                span_id=span_id,
+                                trace_id=trace_id,
+                            )
 
             return wrapper
 
-        # Allow both `@observe` and `@observe()` and `@observe("name")`
-        if callable(name):
-            fn, name = name, None
-            return decorator(fn)
+        # Allow @observe, @observe(), and @observe("name")
+        if callable(name_or_fn):
+            return decorator(name_or_fn)
         return decorator
 
     return decorator_factory

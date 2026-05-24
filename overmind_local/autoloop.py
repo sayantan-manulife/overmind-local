@@ -6,7 +6,7 @@ Cycle:
   2. LLM proposes a specific change
   3. Apply the change
   4. Run the metric command (must print a float to stdout)
-  5. Keep if better, git-revert if not
+  5. Keep if better, revert if not
   6. Log result → repeat
 
 The human steers by editing `program.md` (or equivalent) between runs.
@@ -16,12 +16,13 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
 import litellm
 
-from .storage import get_spans, get_policies, get_dataset, write_span
+from .storage import get_spans, get_policies, write_span
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────
@@ -34,10 +35,10 @@ def run_autoloop(
     direction: str = "higher",      # "higher" or "lower" is better
     iterations: int = 20,
     model: str = "gpt-4o",
-    program_md: Optional[str] = None,  # optional steering doc (like Karpathy's program.md)
+    program_md: Optional[str] = None,
     db_path: Optional[Path] = None,
     log_fn=print,
-):
+) -> float:
     """
     Run the autoresearch loop.
 
@@ -56,7 +57,7 @@ def run_autoloop(
     program_text = Path(program_md).read_text() if program_md else ""
     best_content = target.read_text()
     best_score: Optional[float] = None
-    history: list[dict] = []
+    history: list = []
 
     log_fn(f"\n🔬 Autoresearch loop — {iterations} iterations max")
     log_fn(f"   Target file : {target}")
@@ -79,7 +80,7 @@ def run_autoloop(
             traces=traces,
             policies=policies,
             program_text=program_text,
-            history=history[-10:],  # last 10 outcomes for context
+            history=history[-10:],
             model=model,
         )
 
@@ -110,14 +111,15 @@ def run_autoloop(
 
         log_fn(f"  Score: {score:.4f}  (best: {best_score:.4f})  → {verb}")
 
-        outcome = {"iteration": i, "score": score, "action": verb.split()[0]}
-        history.append(outcome)
+        history.append({"iteration": i, "score": score, "action": verb.split()[0]})
 
-        # Record in traces DB so `overmind-local traces` shows the loop
         _record_loop_span(agent_name, i, score, best_score, verb, db_path)
 
-        # Small pause to avoid hammering the LLM API
         time.sleep(1)
+
+    if best_score is None:
+        log_fn("\n⚠ Loop complete. No valid score produced — all iterations skipped or metric failed.")
+        return 0.0
 
     log_fn(f"\n✅ Loop complete. Best score: {best_score:.4f}")
     log_fn(f"   Best content written to: {target}")
@@ -170,8 +172,6 @@ Output the complete new file content now:"""
         temperature=0.4,
     )
     raw = resp.choices[0].message.content.strip()
-
-    # Strip accidental markdown fences if the LLM added them anyway
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
     return raw
@@ -182,7 +182,6 @@ def _run_metric(cmd: str) -> Optional[float]:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=300
         )
-        # Take the last non-empty line that parses as a float
         for line in reversed(result.stdout.strip().splitlines()):
             line = line.strip()
             if line:
@@ -196,9 +195,7 @@ def _run_metric(cmd: str) -> Optional[float]:
 
 
 def _is_better(score: float, best: float, direction: str) -> bool:
-    if direction == "higher":
-        return score > best
-    return score < best
+    return score > best if direction == "higher" else score < best
 
 
 def _summarise_traces(traces: list) -> str:
@@ -207,16 +204,15 @@ def _summarise_traces(traces: list) -> str:
     lines = []
     for s in traces[:20]:
         err = s.get("error")
+        dur = s.get("duration_ms") or 0
         lines.append(
-            f"  {s['name']} ({s['span_type']}) "
-            f"{s['duration_ms']:.0f}ms"
-            + (f"  ✗ {err[:60]}" if err else "  ✓")
+            f"  {s['name']} ({s['span_type']}) {dur:.0f}ms"
+            + (f"  ✗ {str(err)[:60]}" if err else "  ✓")
         )
     return "\n".join(lines)
 
 
 def _record_loop_span(agent_name, iteration, score, best_score, verb, db_path):
-    import uuid
     write_span({
         "id": str(uuid.uuid4()),
         "trace_id": str(uuid.uuid4()),
@@ -230,5 +226,5 @@ def _record_loop_span(agent_name, iteration, score, best_score, verb, db_path):
         "start_time": time.time(),
         "end_time": time.time(),
         "duration_ms": 0,
-        "metadata": {"direction": "autoloop"},
+        "metadata": {},
     }, db_path=db_path)

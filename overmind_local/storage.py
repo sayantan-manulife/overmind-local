@@ -95,7 +95,18 @@ def get_spans(agent_name: Optional[str] = None, limit: int = 100,
             p.append(agent_name)
         q += " ORDER BY start_time DESC LIMIT ?"
         p.append(limit)
-        return [dict(r) for r in conn.execute(q, p).fetchall()]
+        return [_deserialize_span(dict(r)) for r in conn.execute(q, p).fetchall()]
+
+
+def _deserialize_span(row: Dict[str, Any]) -> Dict[str, Any]:
+    for field in ("input", "output", "metadata"):
+        val = row.get(field)
+        if val:
+            try:
+                row[field] = json.loads(val)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return row
 
 
 def get_policies(agent_name: str, db_path: Optional[Path] = None) -> List[Dict[str, Any]]:

@@ -1,10 +1,9 @@
 """Monkey-patch OpenAI and Anthropic clients to auto-capture LLM spans."""
 import time
 import uuid
-import json
 from typing import Any
 
-from .tracing import _record, get_trace_id, get_span_id, get_agent_name, _safe
+from .tracing import _record, get_trace_id, _safe
 
 
 def instrument_all():
@@ -16,13 +15,8 @@ def instrument_all():
 def instrument_openai():
     try:
         import openai.resources.chat.completions as _mod
-        _patch_openai_sync(_mod)
-    except (ImportError, AttributeError):
-        pass
-
-    try:
-        import openai.resources.chat.completions as _mod
-        _patch_openai_async(_mod)
+        _patch_cls(_mod, "Completions", is_async=False, extract_fn=_openai_output, name_prefix="openai")
+        _patch_cls(_mod, "AsyncCompletions", is_async=True, extract_fn=_openai_output, name_prefix="openai")
     except (ImportError, AttributeError):
         pass
 
@@ -30,81 +24,73 @@ def instrument_openai():
 def instrument_anthropic():
     try:
         import anthropic.resources.messages as _mod
-        _patch_anthropic_sync(_mod)
+        _patch_cls(_mod, "Messages", is_async=False, extract_fn=_anthropic_output, name_prefix="anthropic")
+        _patch_cls(_mod, "AsyncMessages", is_async=True, extract_fn=_anthropic_output, name_prefix="anthropic")
     except (ImportError, AttributeError):
         pass
 
 
-# ── OpenAI sync ────────────────────────────────────────────────────────────────
+# ── Patch factory ──────────────────────────────────────────────────────────────
 
-def _patch_openai_sync(mod):
-    if getattr(mod.Completions, "_overmind_patched", False):
+def _patch_cls(mod, cls_name: str, *, is_async: bool, extract_fn, name_prefix: str):
+    cls = getattr(mod, cls_name, None)
+    if cls is None or getattr(cls, "_overmind_patched", False):
         return
-    original = mod.Completions.create
+    original = cls.create
 
-    def patched(self, **kwargs):
-        sid = str(uuid.uuid4())
-        tid = get_trace_id() or str(uuid.uuid4())
-        start = time.time()
-        result = error_msg = None
-        try:
-            result = original(self, **kwargs)
-            return result
-        except Exception as exc:
-            error_msg = str(exc)
-            raise
-        finally:
-            output = _openai_output(result)
-            _record(
-                name=f"openai/{kwargs.get('model', 'unknown')}",
-                span_type="llm",
-                input_data={"model": kwargs.get("model"), "messages": kwargs.get("messages", [])},
-                output_data=output,
-                error=error_msg,
-                start=start,
-                end=time.time(),
-                metadata={"model": kwargs.get("model"), "temperature": kwargs.get("temperature")},
-                span_id=sid,
-                trace_id=tid,
-            )
+    def _emit(kwargs, result, error_msg, start, sid, tid):
+        input_data = {"model": kwargs.get("model"), "messages": kwargs.get("messages", [])}
+        if "system" in kwargs:
+            input_data["system"] = kwargs["system"]
+        _record(
+            name=f"{name_prefix}/{kwargs.get('model', 'unknown')}",
+            span_type="llm",
+            input_data=input_data,
+            output_data=extract_fn(result),
+            error=error_msg,
+            start=start,
+            end=time.time(),
+            metadata={
+                "model": kwargs.get("model"),
+                "temperature": kwargs.get("temperature"),
+                "max_tokens": kwargs.get("max_tokens"),
+            },
+            span_id=sid,
+            trace_id=tid,
+        )
 
-    mod.Completions.create = patched
-    mod.Completions._overmind_patched = True
+    if is_async:
+        async def patched(self, **kwargs):
+            sid, tid = str(uuid.uuid4()), get_trace_id() or str(uuid.uuid4())
+            start = time.time()
+            result = error_msg = None
+            try:
+                result = await original(self, **kwargs)
+                return result
+            except Exception as exc:
+                error_msg = str(exc)
+                raise
+            finally:
+                _emit(kwargs, result, error_msg, start, sid, tid)
+    else:
+        def patched(self, **kwargs):
+            sid, tid = str(uuid.uuid4()), get_trace_id() or str(uuid.uuid4())
+            start = time.time()
+            result = error_msg = None
+            try:
+                result = original(self, **kwargs)
+                return result
+            except Exception as exc:
+                error_msg = str(exc)
+                raise
+            finally:
+                _emit(kwargs, result, error_msg, start, sid, tid)
+
+    cls.create = patched
+    cls._overmind_patched = True
 
 
-def _patch_openai_async(mod):
-    if getattr(mod.AsyncCompletions, "_overmind_patched", False):
-        return
-    original = mod.AsyncCompletions.create
-
-    async def patched(self, **kwargs):
-        sid = str(uuid.uuid4())
-        tid = get_trace_id() or str(uuid.uuid4())
-        start = time.time()
-        result = error_msg = None
-        try:
-            result = await original(self, **kwargs)
-            return result
-        except Exception as exc:
-            error_msg = str(exc)
-            raise
-        finally:
-            _record(
-                name=f"openai/{kwargs.get('model', 'unknown')}",
-                span_type="llm",
-                input_data={"model": kwargs.get("model"), "messages": kwargs.get("messages", [])},
-                output_data=_openai_output(result),
-                error=error_msg,
-                start=start,
-                end=time.time(),
-                metadata={"model": kwargs.get("model")},
-                span_id=sid,
-                trace_id=tid,
-            )
-
-    mod.AsyncCompletions.create = patched
-    mod.AsyncCompletions._overmind_patched = True
-
+# ── Output extractors ──────────────────────────────────────────────────────────
 
 def _openai_output(result: Any) -> dict:
     if result is None:
@@ -124,44 +110,6 @@ def _openai_output(result: Any) -> dict:
         }
     except Exception:
         return _safe(result)
-
-
-# ── Anthropic sync ─────────────────────────────────────────────────────────────
-
-def _patch_anthropic_sync(mod):
-    if getattr(mod.Messages, "_overmind_patched", False):
-        return
-    original = mod.Messages.create
-
-    def patched(self, **kwargs):
-        sid = str(uuid.uuid4())
-        tid = get_trace_id() or str(uuid.uuid4())
-        start = time.time()
-        result = error_msg = None
-        try:
-            result = original(self, **kwargs)
-            return result
-        except Exception as exc:
-            error_msg = str(exc)
-            raise
-        finally:
-            output = _anthropic_output(result)
-            _record(
-                name=f"anthropic/{kwargs.get('model', 'unknown')}",
-                span_type="llm",
-                input_data={"model": kwargs.get("model"), "messages": kwargs.get("messages", []),
-                            "system": kwargs.get("system")},
-                output_data=output,
-                error=error_msg,
-                start=start,
-                end=time.time(),
-                metadata={"model": kwargs.get("model"), "max_tokens": kwargs.get("max_tokens")},
-                span_id=sid,
-                trace_id=tid,
-            )
-
-    mod.Messages.create = patched
-    mod.Messages._overmind_patched = True
 
 
 def _anthropic_output(result: Any) -> dict:

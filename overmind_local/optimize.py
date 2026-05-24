@@ -1,5 +1,4 @@
 """Optimization loop: read local traces → LLM analysis → ranked suggestions."""
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -34,26 +33,19 @@ def run_optimization(
         }
         if s.get("error"):
             entry["error"] = s["error"]
-        try:
-            inp = json.loads(s["input"] or "null")
-            if inp and isinstance(inp, dict):
-                # Truncate long string values
-                entry["input"] = {
-                    k: (v[:200] + "…" if isinstance(v, str) and len(v) > 200 else v)
-                    for k, v in inp.items()
-                }
-        except Exception:
-            pass
-        try:
-            out = json.loads(s["output"] or "null")
-            if out and isinstance(out, dict) and "content" in out:
-                content = out["content"]
-                entry["output_preview"] = (
-                    content[:200] + "…" if isinstance(content, str) and len(content) > 200
-                    else content
-                )
-        except Exception:
-            pass
+        inp = s.get("input")
+        if inp and isinstance(inp, dict):
+            entry["input"] = {
+                k: (v[:200] + "…" if isinstance(v, str) and len(v) > 200 else v)
+                for k, v in inp.items()
+            }
+        out = s.get("output")
+        if out and isinstance(out, dict) and "content" in out:
+            content = out["content"]
+            entry["output_preview"] = (
+                content[:200] + "…" if isinstance(content, str) and len(content) > 200
+                else content
+            )
         trace_summary.append(entry)
 
     policy_lines = "\n".join(

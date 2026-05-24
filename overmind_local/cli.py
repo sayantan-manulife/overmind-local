@@ -291,9 +291,82 @@ def autoloop(agent_name, target, metric, direction, iterations, model, program_m
             db_path=db,
             log_fn=lambda s: console.print(s),
         )
-        console.print(f"\n[green bold]✅ Best score: {best:.4f}[/green bold]")
+        if best:
+            console.print(f"\n[green bold]✅ Best score: {best:.4f}[/green bold]")
     except KeyboardInterrupt:
         console.print("\n[yellow]Loop interrupted.[/yellow]")
+
+
+# ── gepa ───────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("agent_name")
+@click.option("--target", required=True,
+              help="File the LLM is allowed to edit")
+@click.option("--metric", required=True,
+              help="Shell command that prints a single float to stdout")
+@click.option("--direction", type=click.Choice(["higher", "lower"]), default="higher",
+              show_default=True)
+@click.option("--cycles", default=20, show_default=True,
+              help="Number of Select→Reflect→Mutate cycles")
+@click.option("--pareto-k", default=5, show_default=True,
+              help="Maximum Pareto front size")
+@click.option("--merge-every", default=5, show_default=True,
+              help="Perform a system-aware merge every N cycles")
+@click.option("--model", default="gpt-4o", show_default=True,
+              help="LLM model (uses your own API key via litellm)")
+@click.option("--program-md", default=None,
+              help="Path to a Markdown file with research direction")
+@click.option("--dir", "dir_", default=DEFAULT_DIR, show_default=True)
+def gepa(agent_name, target, metric, direction, cycles, pareto_k, merge_every,
+         model, program_md, dir_):
+    """GEPA: Generative Evolutionary Prompt Adaptation (https://github.com/gepa-ai/gepa).
+
+    \b
+    Maintains a Pareto frontier of candidates, diagnoses failure modes via LLM
+    reflection on traces (ASI), then mutates and merges complementary candidates.
+    Converges faster than hill-climbing when the search space has local optima.
+
+    \b
+    Example:
+      overmind-local gepa my-agent \\
+        --target prompts.yaml \\
+        --metric "python eval.py" \\
+        --cycles 20 \\
+        --pareto-k 5
+    """
+    from overmind_local.gepa import run_gepa
+
+    db = _db(dir_)
+    if not db.exists():
+        from overmind_local.storage import init as _init
+        _init(dir_)
+
+    console.print(f"[blue]Starting GEPA for '[bold]{agent_name}[/bold]'[/blue]")
+    console.print(
+        f"  target=[cyan]{target}[/cyan]  cycles=[cyan]{cycles}[/cyan]  "
+        f"pareto_k=[cyan]{pareto_k}[/cyan]  merge_every=[cyan]{merge_every}[/cyan]  "
+        f"model=[cyan]{model}[/cyan]\n"
+    )
+
+    try:
+        best = run_gepa(
+            agent_name=agent_name,
+            target_file=target,
+            metric_cmd=metric,
+            direction=direction,
+            cycles=cycles,
+            pareto_k=pareto_k,
+            merge_every=merge_every,
+            model=model,
+            program_md=program_md,
+            db_path=db,
+            log_fn=lambda s: console.print(s),
+        )
+        if best:
+            console.print(f"\n[green bold]✅ Best score: {best:.4f}[/green bold]")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]GEPA interrupted.[/yellow]")
 
 
 # ── copilot ────────────────────────────────────────────────────────────────────
