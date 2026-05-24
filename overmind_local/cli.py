@@ -241,5 +241,112 @@ def stats(dir_):
     console.print(t)
 
 
+# ── autoloop ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("agent_name")
+@click.option("--target", required=True,
+              help="File the LLM is allowed to edit (e.g. prompts.yaml, agent.py)")
+@click.option("--metric", required=True,
+              help="Shell command that prints a single float to stdout (your eval script)")
+@click.option("--direction", type=click.Choice(["higher", "lower"]), default="higher",
+              show_default=True, help="Which direction is better for the metric")
+@click.option("--iterations", default=20, show_default=True)
+@click.option("--model", default="gpt-4o", show_default=True,
+              help="LLM model. Use 'copilot' for GitHub Copilot (needs GITHUB_TOKEN)")
+@click.option("--program-md", default=None,
+              help="Path to a Markdown file with research direction (like Karpathy's program.md)")
+@click.option("--dir", "dir_", default=DEFAULT_DIR, show_default=True)
+def autoloop(agent_name, target, metric, direction, iterations, model, program_md, dir_):
+    """Karpathy-style autoresearch loop: propose → test → keep/revert → repeat.
+
+    \b
+    Example:
+      overmind-local autoloop my-agent \\
+        --target prompts.yaml \\
+        --metric "python eval.py" \\
+        --direction higher \\
+        --iterations 30 \\
+        --model copilot
+    """
+    from overmind_local.autoloop import run_autoloop
+    from overmind_local.copilot import resolve_model, check_github_token
+
+    resolved = resolve_model(model)
+    if resolved.startswith("github/"):
+        token = check_github_token()
+        if not token:
+            console.print("[red]GITHUB_TOKEN not set and `gh auth token` failed.[/red]")
+            console.print("Run: export GITHUB_TOKEN=$(gh auth token)")
+            return
+        console.print(f"[dim]GitHub token found — using {resolved}[/dim]")
+
+    db = _db(dir_)
+    if not db.exists():
+        from overmind_local.storage import init as _init
+        _init(dir_)
+
+    console.print(f"[blue]Starting autoresearch loop for '[bold]{agent_name}[/bold]'[/blue]")
+    console.print(f"  target=[cyan]{target}[/cyan]  metric=[cyan]{metric}[/cyan]  "
+                  f"model=[cyan]{resolved}[/cyan]  iter=[cyan]{iterations}[/cyan]\n")
+
+    try:
+        best = run_autoloop(
+            agent_name=agent_name,
+            target_file=target,
+            metric_cmd=metric,
+            direction=direction,
+            iterations=iterations,
+            model=resolved,
+            program_md=program_md,
+            db_path=db,
+            log_fn=lambda s: console.print(s),
+        )
+        console.print(f"\n[green bold]✅ Best score: {best:.4f}[/green bold]")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Loop interrupted.[/yellow]")
+
+
+# ── copilot ────────────────────────────────────────────────────────────────────
+
+@cli.group()
+def copilot():
+    """GitHub Copilot CLI integration."""
+    pass
+
+
+@copilot.command("explain")
+@click.option("--agent", default=None)
+@click.option("--dir", "dir_", default=DEFAULT_DIR, show_default=True)
+def copilot_explain(agent, dir_):
+    """Use `gh copilot explain` to summarise recent traces in plain English."""
+    from overmind_local.copilot import explain_traces, gh_copilot_available
+    from overmind_local.storage import get_spans
+
+    if not gh_copilot_available():
+        console.print("[red]gh copilot not found.[/red]")
+        console.print("Install: gh extension install github/gh-copilot")
+        return
+
+    spans = get_spans(agent_name=agent, limit=20, db_path=_db(dir_))
+    if not spans:
+        console.print("[yellow]No traces to explain.[/yellow]")
+        return
+
+    console.print("[blue]Asking gh copilot to explain your traces...[/blue]")
+    result = explain_traces(spans)
+    console.print(Panel(result, title="gh copilot explain", border_style="cyan"))
+
+
+@copilot.command("models")
+def copilot_models():
+    """List available GitHub Copilot model shorthands."""
+    from overmind_local.copilot import COPILOT_MODELS
+    console.print("[bold]GitHub Copilot model shorthands[/bold] (need GITHUB_TOKEN)\n")
+    for alias, full in COPILOT_MODELS.items():
+        console.print(f"  [cyan]{alias:<20}[/cyan] → {full}")
+    console.print("\nUse with any command: [dim]--model copilot[/dim]")
+
+
 def main():
     cli()
