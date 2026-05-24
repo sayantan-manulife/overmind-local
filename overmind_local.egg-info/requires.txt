@@ -1,0 +1,13 @@
+click>=8.1
+rich>=13.0
+litellm>=1.40
+
+[all]
+openai>=1.0
+anthropic>=0.20
+
+[anthropic]
+anthropic>=0.20
+
+[openai]
+openai>=1.0
