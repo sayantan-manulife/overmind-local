@@ -253,7 +253,7 @@ def stats(dir_):
               show_default=True, help="Which direction is better for the metric")
 @click.option("--iterations", default=20, show_default=True)
 @click.option("--model", default="gpt-4o", show_default=True,
-              help="LLM model. Use 'copilot' for GitHub Copilot (needs GITHUB_TOKEN)")
+              help="LLM model for the propose step (uses your own API key via litellm)")
 @click.option("--program-md", default=None,
               help="Path to a Markdown file with research direction (like Karpathy's program.md)")
 @click.option("--dir", "dir_", default=DEFAULT_DIR, show_default=True)
@@ -266,20 +266,9 @@ def autoloop(agent_name, target, metric, direction, iterations, model, program_m
         --target prompts.yaml \\
         --metric "python eval.py" \\
         --direction higher \\
-        --iterations 30 \\
-        --model copilot
+        --iterations 30
     """
     from overmind_local.autoloop import run_autoloop
-    from overmind_local.copilot import resolve_model, check_github_token
-
-    resolved = resolve_model(model)
-    if resolved.startswith("github/"):
-        token = check_github_token()
-        if not token:
-            console.print("[red]GITHUB_TOKEN not set and `gh auth token` failed.[/red]")
-            console.print("Run: export GITHUB_TOKEN=$(gh auth token)")
-            return
-        console.print(f"[dim]GitHub token found — using {resolved}[/dim]")
 
     db = _db(dir_)
     if not db.exists():
@@ -288,7 +277,7 @@ def autoloop(agent_name, target, metric, direction, iterations, model, program_m
 
     console.print(f"[blue]Starting autoresearch loop for '[bold]{agent_name}[/bold]'[/blue]")
     console.print(f"  target=[cyan]{target}[/cyan]  metric=[cyan]{metric}[/cyan]  "
-                  f"model=[cyan]{resolved}[/cyan]  iter=[cyan]{iterations}[/cyan]\n")
+                  f"model=[cyan]{model}[/cyan]  iter=[cyan]{iterations}[/cyan]\n")
 
     try:
         best = run_autoloop(
@@ -297,7 +286,7 @@ def autoloop(agent_name, target, metric, direction, iterations, model, program_m
             metric_cmd=metric,
             direction=direction,
             iterations=iterations,
-            model=resolved,
+            model=model,
             program_md=program_md,
             db_path=db,
             log_fn=lambda s: console.print(s),
@@ -316,10 +305,11 @@ def copilot():
 
 
 @copilot.command("explain")
-@click.option("--agent", default=None)
+@click.option("--agent", default=None, help="Filter traces by agent name")
+@click.option("--limit", default=15, show_default=True)
 @click.option("--dir", "dir_", default=DEFAULT_DIR, show_default=True)
-def copilot_explain(agent, dir_):
-    """Use `gh copilot explain` to summarise recent traces in plain English."""
+def copilot_explain(agent, limit, dir_):
+    """Pipe recent traces through `gh copilot explain` for a plain-English summary."""
     from overmind_local.copilot import explain_traces, gh_copilot_available
     from overmind_local.storage import get_spans
 
@@ -328,24 +318,47 @@ def copilot_explain(agent, dir_):
         console.print("Install: gh extension install github/gh-copilot")
         return
 
-    spans = get_spans(agent_name=agent, limit=20, db_path=_db(dir_))
+    spans = get_spans(agent_name=agent, limit=limit, db_path=_db(dir_))
     if not spans:
-        console.print("[yellow]No traces to explain.[/yellow]")
+        console.print("[yellow]No traces found.[/yellow]")
         return
 
-    console.print("[blue]Asking gh copilot to explain your traces...[/blue]")
+    console.print(f"[blue]Piping {len(spans)} spans through gh copilot explain...[/blue]")
     result = explain_traces(spans)
     console.print(Panel(result, title="gh copilot explain", border_style="cyan"))
 
 
-@copilot.command("models")
-def copilot_models():
-    """List available GitHub Copilot model shorthands."""
-    from overmind_local.copilot import COPILOT_MODELS
-    console.print("[bold]GitHub Copilot model shorthands[/bold] (need GITHUB_TOKEN)\n")
-    for alias, full in COPILOT_MODELS.items():
-        console.print(f"  [cyan]{alias:<20}[/cyan] → {full}")
-    console.print("\nUse with any command: [dim]--model copilot[/dim]")
+@copilot.command("suggest")
+@click.argument("agent_name")
+@click.option("--dir", "dir_", default=DEFAULT_DIR, show_default=True)
+def copilot_suggest(agent_name, dir_):
+    """Use `gh copilot suggest` to get a fix based on the most recent errors."""
+    from overmind_local.copilot import suggest_fix, gh_copilot_available
+    from overmind_local.storage import get_spans
+
+    if not gh_copilot_available():
+        console.print("[red]gh copilot not found.[/red]")
+        console.print("Install: gh extension install github/gh-copilot")
+        return
+
+    spans = get_spans(agent_name=agent_name, limit=30, db_path=_db(dir_))
+    errors = [s for s in spans if s.get("error")]
+    if not errors:
+        console.print("[yellow]No errors found in recent traces.[/yellow]")
+        return
+
+    # Build a description of the failure pattern
+    error_summary = "; ".join(
+        f"{s['name']}: {s['error']}" for s in errors[:5]
+    )
+    problem = (
+        f"My AI agent '{agent_name}' is failing with these errors: {error_summary}. "
+        f"How do I fix this?"
+    )
+
+    console.print(f"[blue]Asking gh copilot suggest about {len(errors)} error(s)...[/blue]")
+    result = suggest_fix(problem)
+    console.print(Panel(result, title="gh copilot suggest", border_style="cyan"))
 
 
 def main():
